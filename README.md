@@ -2,17 +2,30 @@
 
 `ehd_flow.py` runs a lightweight 2D incompressible-flow simulation (phiFlow)
 past polygonal obstacles -- the drag half of the ionocraft problem. No ion
-forces yet; subclass `BodyForce` in `ehd_flow/forces.py` for the phase-2
+forces yet; subclass `BodyForce` in `src/ehd_flow/forces.py` for the phase-2
 ion-drag force field -- the solver needs no changes.
 
-The implementation lives in the `ehd_flow/` package (one class per
-responsibility: `config`, `geometry`, `forces`, `solver`, `rendering`,
-`cli`); `ehd_flow.py` at the root is a thin shim so the old command line
-keeps working. `python -m ehd_flow ...` also works.
+Layout (telempy-style `src/` tree):
+
+    src/ehd_flow/
+        config.py, geometry.py, forces.py     # sim config, polygons, body forces
+        solver.py, rendering.py, cli.py       # phiFlow solver, output, flow CLI
+        polygons.py, polygons_cli.py          # PolygonExtractor + image_to_polygons CLI
+        coulomb.py, coulomb_cli.py            # CoulombField + coulomb_field CLI
+
+The root scripts (`ehd_flow.py`, `image_to_polygons.py`, `coulomb_field.py`)
+are thin CLI wrappers that add `src/` to the import path, so they run from
+any directory with no setup. `image_to_polygons.py` and `coulomb_field.py`
+share the same `PolygonExtractor` helper class -- the old
+`from image_to_polygons import ...` sibling import is gone.
 
 ## Install
 
-    pip install phiflow matplotlib
+    pip install -r requirements.txt
+
+or, to also get importable `ehd_flow` + console scripts from anywhere:
+
+    pip install -e .
 
 (ffmpeg is needed only for `--movie`; check with `which ffmpeg`.)
 
@@ -54,6 +67,21 @@ Coordinates are in domain units (meters). Each polygon is either
   ]
 }
 ```
+
+## Companion tools
+
+`image_to_polygons.py` converts an image into solver-ready polygon JSON
+(grayscale, binarize at 127.5, external contours only, Douglas-Peucker
+simplify), with a green-bordered preview PNG:
+
+    python image_to_polygons.py input.png obstacles.json --no-window
+
+`coulomb_field.py` renders Coulomb field lines for image-defined electrodes
+(red channel -> positive, blue channel -> negative, arrows show +ion drift):
+
+    python coulomb_field.py electrodes.png --charge-ratio 0.5 --no-window
+
+Both are wrappers over `src/ehd_flow/` (`PolygonExtractor`, `CoulombField`).
 
 ## Cost
 

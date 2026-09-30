@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ehd-flow"
+version = "0.1.0"
+description = "2D EHD/ionocraft flow sandbox: phiFlow aerodynamics, image-to-polygon obstacles, Coulomb field visualizer"
+requires-python = ">=3.10"
+dependencies = [
+    "phiflow==3.4.0",
+    "matplotlib==3.11.2",
+    "opencv-python",
+    "numpy",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+ehd-flow = "ehd_flow.cli:main"
+image-to-polygons = "ehd_flow.polygons_cli:main"
+coulomb-field = "ehd_flow.coulomb_cli:main"
