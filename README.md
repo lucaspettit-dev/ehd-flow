@@ -2,8 +2,13 @@
 
 `ehd_flow.py` runs a lightweight 2D incompressible-flow simulation (phiFlow)
 past polygonal obstacles -- the drag half of the ionocraft problem. No ion
-forces yet; the `apply_body_force()` hook in the script is where the phase-2
-ion-drag force field goes.
+forces yet; subclass `BodyForce` in `ehd_flow/forces.py` for the phase-2
+ion-drag force field -- the solver needs no changes.
+
+The implementation lives in the `ehd_flow/` package (one class per
+responsibility: `config`, `geometry`, `forces`, `solver`, `rendering`,
+`cli`); `ehd_flow.py` at the root is a thin shim so the old command line
+keeps working. `python -m ehd_flow ...` also works.
 
 ## Install
 
