@@ -286,7 +286,9 @@ def main(argv=None):
 
             ani = animation.FuncAnimation(fig, update, frames=len(frames),
                                           interval=1000 // args.movie_fps)
-            writer = animation.FFMpegWriter(fps=args.movie_fps, codec="libx264")
+            # yuv420p: QuickTime Player only accepts H.264 with 4:2:0 chroma
+            writer = animation.FFMpegWriter(fps=args.movie_fps, codec="libx264",
+                                            extra_args=["-pix_fmt", "yuv420p"])
             ani.save(args.movie, writer=writer)
             plt.close(fig)
             print(f"wrote movie: {args.movie} "
