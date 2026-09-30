@@ -1,0 +1,15 @@
+# ehd-flow dependencies (pip install -r requirements.txt)
+#
+# Covers all scripts in this repo:
+#   ehd_flow/ package + ehd_flow.py      -> phiflow, matplotlib, numpy
+#   image_to_polygons.py                 -> opencv-python, numpy
+#   coulomb_field.py                     -> opencv-python, numpy, matplotlib
+#                                          (also imports image_to_polygons.py,
+#                                           so keep both files side by side)
+#
+# System (not pip): ffmpeg is required only for ehd_flow's --movie output.
+
+phiflow==3.4.0        # flow solver backend (tested with 3.4.0)
+matplotlib==3.11.2    # PNG + movie rendering
+opencv-python         # image loading / contour extraction (verified with 5.0.0)
+numpy                 # pulled in by the above; listed explicitly for clarity
