@@ -30,6 +30,30 @@ def build_parser():
                     help="field-line seeds per electrode")
     ap.add_argument("--line-step", type=float, default=2.5,
                     help="field-line integration step (px)")
+    ap.add_argument("--ions-per-positive", type=int, default=10,
+                    help="ion trajectories seeded per positive electrode "
+                         "(0 disables ion tracing)")
+    ap.add_argument("--ion-qm", type=float, default=2.0,
+                    help="ion charge-to-mass ratio in sim units (higher = "
+                         "lighter ion, follows field lines more closely)")
+    ap.add_argument("--ion-dt", type=float, default=0.05,
+                    help="ion integration timestep (sim time units)")
+    ap.add_argument("--ion-max-steps", type=int, default=4000,
+                    help="cap on ion integration steps")
+    ap.add_argument("--ion-v0", type=float, default=0.0,
+                    help="ion initial speed along local E (0 = start at rest)")
+    ap.add_argument("--space-charge", type=float, default=0.5,
+                    help="total + charge of the ion cloud fed back into "
+                         "the field (electrodes total +/-1; 0 = ghost "
+                         "test-particle ions)")
+    ap.add_argument("--sc-iters", type=int, default=4,
+                    help="max space-charge self-consistency rounds")
+    ap.add_argument("--sc-relax", type=float, default=0.7,
+                    help="under-relaxation factor for deposited charge")
+    ap.add_argument("--sc-tol", type=float, default=1e-3,
+                    help="stop iterating when grid |dE|/|E| < this")
+    ap.add_argument("--sc-grid", type=int, default=32,
+                    help="space-charge deposition grid cells across width")
     ap.add_argument("--no-window", action="store_true",
                     help="do not try to open a preview window")
     return ap
@@ -44,7 +68,17 @@ def main(argv=None):
                              min_area=args.min_area,
                              charge_spacing=args.charge_spacing,
                              seeds=args.seeds,
-                             line_step=args.line_step)
+                             line_step=args.line_step,
+                             ions_per_positive=args.ions_per_positive,
+                             ion_qm=args.ion_qm,
+                             ion_dt=args.ion_dt,
+                             ion_max_steps=args.ion_max_steps,
+                             ion_v0=args.ion_v0,
+                             space_charge=args.space_charge,
+                             sc_iters=args.sc_iters,
+                             sc_relax=args.sc_relax,
+                             sc_tol=args.sc_tol,
+                             sc_grid=args.sc_grid)
     except (ImportError, ValueError) as e:
         sys.exit(f"error: {e}")
 

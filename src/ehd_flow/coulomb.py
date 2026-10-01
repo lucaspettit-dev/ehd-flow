@@ -10,13 +10,34 @@ its total charge is spread over point charges along its boundary, and the
 field is the Coulomb sum over all of them (k = 1, arbitrary units).
 
 Field lines are seeded around the electrodes and integrated along E, drawn
-in the style of magnetic field-line diagrams. Arrowheads always point along
-E, i.e. the direction a positive ion drifts (positive -> negative).
+thin and dashed. Separately, positive-ion trajectories are integrated with
+full Newtonian dynamics (m*dv/dt = q*E, velocity Verlet), so their inertia
+makes them deviate from the massless field lines -- the deviation is the
+point of the overlay.
 
 Charge ratio R sets |Q_negative| / |Q_positive| = R:
   R = 1   -> equal magnitude (default)
   R = 0.5 -> positive is 2x more charged than negative
   R = 2   -> negative is 2x more charged than positive
+
+Ion dynamics note: the field uses k = 1 arbitrary units, so absolute SI
+units cannot be carried through. The ion is taken as singly charged
+(q = +e) with the mass of an average dry-air molecule
+(m = 28.97 g/mol / N_A ~= 4.81e-26 kg); in sim units only the
+charge-to-mass ratio ``ion_qm`` matters. Raise it for a lighter/faster
+ion (tracks field lines more closely), lower it for more inertia and
+larger deviation from the field lines.
+
+Space charge: optionally, the ions are not just test particles. Each
+iteration traces ion paths in the current field, deposits their
+time-averaged charge onto a fixed grid over the domain (the traced
+cohort stands in for a steady emission stream; ``space_charge`` is its
+total charge in the same units where each electrode totals +/-1), and
+re-traces both field lines and ion paths in the updated field. The
+positive cloud shields the emitter and reshapes the gap field, as in a
+real corona. Iterating stops when the field change on the deposition
+grid falls below ``sc_tol`` or after ``sc_iters`` rounds; ``sc_relax``
+under-relaxes the deposited charge for stability.
 """
 
 import os
@@ -29,6 +50,13 @@ except ImportError:
     cv2 = None
 
 from .polygons import PolygonExtractor, show_image
+
+# Ion properties (dry-air average molecule, singly charged positive ion)
+ION_MASS_GMOL = 28.97
+AVOGADRO = 6.02214076e23
+ELEMENTARY_CHARGE = 1.602176634e-19
+ION_MASS_KG = (ION_MASS_GMOL * 1e-3) / AVOGADRO  # ~= 4.81e-26 kg
+ION_Q_OVER_M_SI = ELEMENTARY_CHARGE / ION_MASS_KG  # ~= 3.33e6 C/kg
 
 
 def efield(pts, cpos, cq, soft, chunk=20000):
@@ -46,7 +74,7 @@ def efield(pts, cpos, cq, soft, chunk=20000):
 
 
 class CoulombField:
-    """Field lines + arrows for image-defined electrodes.
+    """Field lines (thin, dashed) + ion trajectories (solid) for electrodes.
 
     Parameters:
       charge_ratio   -- |Q_negative| / |Q_positive|.
@@ -55,10 +83,28 @@ class CoulombField:
       charge_spacing -- spacing (px) of discrete charges along edges.
       seeds          -- field-line seeds per electrode.
       line_step      -- field-line integration step (px).
+      ions_per_positive -- ion trajectories seeded per positive electrode
+                        (0 disables ion tracing).
+      ion_qm         -- ion charge-to-mass ratio in sim units (higher =
+                        lighter ion, follows field lines more closely).
+      ion_dt         -- ion integration timestep (sim time units).
+      ion_max_steps  -- cap on ion integration steps.
+      ion_v0         -- ion initial speed along local E (0 = start at rest).
+      space_charge   -- total + charge of the ion cloud deposited back
+                        into the field (electrodes total +/-1; 0 = ions
+                        stay ghost test particles).
+      sc_iters       -- max space-charge self-consistency iterations.
+      sc_relax       -- under-relaxation factor for deposited charge.
+      sc_tol         -- stop iterating when grid field change < this.
+      sc_grid        -- space-charge deposition grid cells across width.
     """
 
     def __init__(self, charge_ratio=1.0, epsilon=0.002, min_area=10.0,
-                 charge_spacing=3.0, seeds=48, line_step=2.5):
+                 charge_spacing=3.0, seeds=48, line_step=2.5,
+                 ions_per_positive=10, ion_qm=2.0, ion_dt=0.05,
+                 ion_max_steps=4000, ion_v0=0.0,
+                 space_charge=0.5, sc_iters=4, sc_relax=0.7,
+                 sc_tol=1e-3, sc_grid=32):
         if cv2 is None:
             raise ImportError(
                 "opencv-python is required (pip install opencv-python)")
@@ -68,6 +114,16 @@ class CoulombField:
         self.charge_spacing = charge_spacing
         self.seeds = seeds
         self.line_step = line_step
+        self.ions_per_positive = ions_per_positive
+        self.ion_qm = ion_qm
+        self.ion_dt = ion_dt
+        self.ion_max_steps = ion_max_steps
+        self.ion_v0 = ion_v0
+        self.space_charge = space_charge
+        self.sc_iters = sc_iters
+        self.sc_relax = sc_relax
+        self.sc_tol = sc_tol
+        self.sc_grid = sc_grid
         self.extractor = PolygonExtractor(epsilon, min_area)
 
     # -- pipeline stages -------------------------------------------------
@@ -115,18 +171,19 @@ class CoulombField:
         ])
         return positions, charges
 
-    def outward_seeds(self, polygons, gap):
+    def outward_seeds(self, polygons, gap, count=None):
         """Seed points just outside each polygon boundary.
 
         Uses cv2.pointPolygonTest so concave shapes get true outward
         normals. Returns (S, 2) array of seed points.
         """
+        count = self.seeds if count is None else count
         seeds = []
         contours = [np.asarray(pts, dtype=np.float32).reshape(-1, 1, 2)
                     for _, pts in polygons]
         for contour in contours:
             n = len(contour)
-            stride = max(1, n // self.seeds)
+            stride = max(1, n // count)
             for j in range(0, n, stride):
                 p0 = contour[j, 0]
                 p1 = contour[(j + 1) % n, 0]
@@ -172,23 +229,146 @@ class CoulombField:
                 lines.append(np.asarray(line))
         return lines
 
+    def trace_ion_paths(self, seeds, cpos_all, q_all, cpos_stop, bounds,
+                        capture):
+        """Integrate m*dv/dt = q*E (velocity Verlet) for positive ions.
+
+        Unlike field lines (massless drift along E/|E|), ions carry
+        momentum, so their paths curve and overshoot where the field
+        bends -- the deviation from the field lines is the point.
+
+        All ions advance in lockstep so the field is evaluated in one
+        batched call per step. The step is adapted every iteration so
+        each step moves the fastest ion by at most ~half the charge
+        spacing (and bounds the acceleration displacement the same
+        way): ions crawl through weak-field regions in few large
+        steps and resolve the strong field near electrodes finely.
+        Because dt varies, every saved point carries the dt it
+        represents, so charge deposition can weight by residence time.
+
+        An ion stops when captured by a negative electrode, when it
+        leaves the domain, or at ion_max_steps. Returns (paths,
+        weights): paths are (K, 2) polylines, weights the (K,) dt
+        each point on the path represents.
+        """
+        h, w = bounds
+        qm = self.ion_qm
+        soft = self.line_step * 0.75
+        cfl = 0.5 * self.charge_spacing          # max move per step (px)
+        dt_max = 40.0 * self.ion_dt
+        P = np.asarray(seeds, dtype=float).reshape(-1, 2).copy()
+        if len(P) == 0:
+            return [], []
+        E = efield(P, cpos_all, q_all, soft=soft)
+        norms = np.linalg.norm(E, axis=1)
+        V = np.where(norms[:, None] > 1e-12,
+                     E / np.maximum(norms, 1e-300)[:, None] * self.ion_v0,
+                     0.0)
+        A = qm * E
+        alive = np.ones(len(P), dtype=bool)
+        paths = [[p.copy()] for p in P]
+        weights = [[0.0] for _ in P]
+        dt = self.ion_dt
+        for _ in range(self.ion_max_steps):
+            idx = np.flatnonzero(alive)
+            if idx.size == 0:
+                break
+            # adapt dt: fastest displacement / acceleration limits it
+            vmax = float(np.linalg.norm(V[idx], axis=1).max(initial=0.0))
+            amax = float(np.linalg.norm(A[idx], axis=1).max(initial=0.0))
+            dt_step = dt_max
+            if vmax > 1e-12:
+                dt_step = min(dt_step, cfl / vmax)
+            if amax > 1e-12:
+                dt_step = min(dt_step, np.sqrt(2.0 * cfl / amax))
+            dt = max(min(dt_step, 1.5 * dt), 1e-6 * dt_max)
+            V[idx] += 0.5 * A[idx] * dt       # half kick
+            P[idx] += V[idx] * dt             # drift
+            for i in idx:
+                paths[i].append(P[i].copy())
+                weights[i].append(dt)
+            alive &= ((P[:, 0] >= 0) & (P[:, 0] <= w) &
+                      (P[:, 1] >= 0) & (P[:, 1] <= h))
+            idx = np.flatnonzero(alive)
+            if idx.size == 0:
+                break
+            if len(cpos_stop):
+                d = np.linalg.norm(
+                    P[idx][:, None, :] - cpos_stop[None, :, :], axis=2)
+                alive[idx[d.min(axis=1) < capture]] = False
+                idx = np.flatnonzero(alive)
+                if idx.size == 0:
+                    break
+            A[idx] = qm * efield(P[idx], cpos_all, q_all, soft=soft)
+            V[idx] += 0.5 * A[idx] * dt       # second half kick
+        keep = [i for i, p in enumerate(paths) if len(p) > 4]
+        return ([np.asarray(paths[i]) for i in keep],
+                [np.asarray(weights[i]) for i in keep])
+
+    def _deposit_grid(self, bounds):
+        """Fixed space-charge deposition grid: (centers (K,2), nx, ny).
+
+        Cell centers span the image; the same grid is reused every
+        iteration so charge vectors can be relaxed and compared.
+        """
+        h, w = bounds
+        nx = max(4, int(self.sc_grid))
+        ny = max(4, int(round(self.sc_grid * h / w)))
+        xs = (np.arange(nx) + 0.5) * w / nx
+        ys = (np.arange(ny) + 0.5) * h / ny
+        cx, cy = np.meshgrid(xs, ys)
+        return np.column_stack([cx.ravel(), cy.ravel()]), nx, ny
+
+    def _deposit_space_charge(self, ion_paths, path_weights, bounds, nx, ny):
+        """Time-averaged ion charge per grid cell, normalized so the
+        total equals self.space_charge.
+
+        Each path point is weighted by the dt it represents, so a cell
+        accumulates charge in proportion to residence time: slow
+        regions (where ions linger) get more charge.
+        Returns (K,) charge per cell center.
+        """
+        h, w = bounds
+        counts = np.zeros(nx * ny)
+        for path, wts in zip(ion_paths, path_weights):
+            ix = np.clip((path[:, 0] / w * nx).astype(int), 0, nx - 1)
+            iy = np.clip((path[:, 1] / h * ny).astype(int), 0, ny - 1)
+            np.add.at(counts, iy * nx + ix, wts)
+        total = counts.sum()
+        if total <= 0:
+            return counts
+        return counts * (self.space_charge / total)
+
     @staticmethod
-    def draw_arrow(img, pt, direction, color, size=9):
-        """Draw a small arrowhead at pt pointing along direction (unit)."""
-        d = np.asarray(direction, dtype=float)
-        n = float(np.linalg.norm(d))
-        if n < 1e-12:
+    def draw_dashed_polyline(img, pts, color, thickness=1, dash=(7, 5)):
+        """Draw a dashed polyline (OpenCV has no native dashed lines)."""
+        pts = np.asarray(pts, dtype=float)
+        if len(pts) < 2:
             return
-        d = d / n
-        start = (pt - d * size * 1.4).astype(int)
-        end = (pt + d * size * 0.5).astype(int)
-        cv2.arrowedLine(img, tuple(start), tuple(end), color, 2,
-                        tipLength=0.45, line_type=cv2.LINE_AA)
+        seg = np.diff(pts, axis=0)
+        seg_len = np.linalg.norm(seg, axis=1)
+        cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+        total = cum[-1]
+        dash_len, gap_len = dash
+        s = 0.0
+        while s < total:
+            e = min(s + dash_len, total)
+            # interpolate sub-segment endpoints along the polyline
+            sub = []
+            for target in (s, e):
+                k = int(np.searchsorted(cum, target, side='right')) - 1
+                k = min(max(k, 0), len(pts) - 2)
+                t = (target - cum[k]) / max(seg_len[k], 1e-12)
+                sub.append(pts[k] + t * seg[k])
+            cv2.line(img, tuple(np.round(sub[0]).astype(int)),
+                     tuple(np.round(sub[1]).astype(int)),
+                     color, thickness, lineType=cv2.LINE_AA)
+            s = e + gap_len
 
     # -- full pipeline ---------------------------------------------------
 
     def render(self, input_image, output=None):
-        """Run the full pipeline: image -> field-line PNG.
+        """Run the full pipeline: image -> field-line + ion-path PNG.
 
         Returns the output path.
         """
@@ -197,26 +377,80 @@ class CoulombField:
 
         pos = self.discretize_boundary(pos_polys, +1.0)
         neg = self.discretize_boundary(neg_polys, -self.charge_ratio)
-        cpos_all = np.vstack([p for p, _ in (pos, neg) if len(p)])
-        q_all = np.concatenate([q for _, q in (pos, neg) if len(q)])
+        elec_pos = np.vstack([p for p, _ in (pos, neg) if len(p)])
+        elec_q = np.concatenate([q for _, q in (pos, neg) if len(q)])
 
         gap = self.charge_spacing
         max_steps = int(2.5 * np.hypot(w, h) / self.line_step)
         capture = self.charge_spacing * 1.5
 
-        lines = []
-        if len(pos[0]):
-            seeds = self.outward_seeds(pos_polys, gap)
-            # follow +E (positive-ion drift); stop at negative electrodes
-            lines += self.trace_field_lines(seeds, cpos_all, q_all, neg[0],
-                                            (h, w), capture, max_steps)
-        if len(neg[0]):
-            seeds = self.outward_seeds(neg_polys, gap)
-            # trace backwards along -E from negatives; arrows still follow +E
-            back = self.trace_field_lines(seeds, cpos_all, -q_all, pos[0],
-                                          (h, w), capture, max_steps)
-            lines += [line[::-1] for line in back]
-        print(f"traced {len(lines)} field lines")
+        # ---- self-consistent space-charge iteration ----
+        # Start from the bare electrode field; each round re-traces the
+        # ion paths, deposits their charge on a fixed grid, relaxes it
+        # into the active charge set, and stops when the field on the
+        # grid stops changing. Final lines/paths are re-traced in the
+        # converged field so the render is self-consistent.
+        sc_enabled = self.space_charge > 0 and self.ions_per_positive > 0
+        centers, nx, ny = self._deposit_grid((h, w))
+        sc_qv = np.zeros(len(centers))
+        n_rounds = max(1, self.sc_iters) if sc_enabled else 1
+        soft = self.line_step * 0.75
+
+        def combined(sc):
+            keep = sc > 1e-12
+            if not keep.any():
+                return elec_pos, elec_q
+            return (np.vstack([elec_pos, centers[keep]]),
+                    np.concatenate([elec_q, sc[keep]]))
+
+        def trace_all(cpos_all, q_all, want_lines=True):
+            lines, ion_paths, path_weights = [], [], []
+            if len(pos[0]):
+                if want_lines:
+                    seeds = self.outward_seeds(pos_polys, gap)
+                    lines += self.trace_field_lines(
+                        seeds, cpos_all, q_all, neg[0], (h, w), capture,
+                        max_steps)
+                if self.ions_per_positive > 0:
+                    ion_seeds = self.outward_seeds(
+                        pos_polys, gap, count=self.ions_per_positive)
+                    ion_paths, path_weights = self.trace_ion_paths(
+                        ion_seeds, cpos_all, q_all, neg[0], (h, w), capture)
+            if want_lines and len(neg[0]):
+                seeds = self.outward_seeds(neg_polys, gap)
+                back = self.trace_field_lines(
+                    seeds, cpos_all, -q_all, pos[0], (h, w), capture,
+                    max_steps)
+                lines += [line[::-1] for line in back]
+            return lines, ion_paths, path_weights
+
+        cpos_all, q_all = elec_pos, elec_q
+        probe_E_prev = None
+        if sc_enabled:
+            for it in range(n_rounds):
+                cpos_all, q_all = combined(sc_qv)
+                probe_E = efield(centers, cpos_all, q_all, soft=soft)
+                if probe_E_prev is not None:
+                    # rel. field change (RMS over grid) vs previous round
+                    num = np.sqrt(((probe_E - probe_E_prev) ** 2)
+                                  .sum(axis=1).mean())
+                    den = np.sqrt((probe_E_prev ** 2)
+                                  .sum(axis=1).mean()) + 1e-300
+                    print(f"space-charge round {it}: |dE|/|E| = "
+                          f"{num / den:.2e} (cloud charge "
+                          f"{sc_qv.sum():.3g})")
+                    if num / den < self.sc_tol:
+                        break
+                probe_E_prev = probe_E
+                _, tmp_paths, tmp_weights = trace_all(cpos_all, q_all,
+                                                      want_lines=False)
+                dep = self._deposit_space_charge(tmp_paths, tmp_weights,
+                                                 (h, w), nx, ny)
+                sc_qv = (1.0 - self.sc_relax) * sc_qv + self.sc_relax * dep
+            cpos_all, q_all = combined(sc_qv)
+
+        lines, ion_paths, _ = trace_all(cpos_all, q_all)
+        print(f"traced {len(lines)} field lines, {len(ion_paths)} ion paths")
 
         # render on a dimmed copy of the input for contrast
         canvas = (color.astype(float) * 0.72).astype(np.uint8)
@@ -228,19 +462,19 @@ class CoulombField:
                                    .astype(np.int32)], True, (255, 0, 0), 2)
         line_color = (255, 255, 0)  # cyan in BGR
         for line in lines:
-            cv2.polylines(canvas, [line.astype(np.int32)], False, line_color,
-                          1, lineType=cv2.LINE_AA)
-            E = efield(line, cpos_all, q_all, soft=self.line_step * 0.75)
-            for frac in (0.3, 0.55, 0.8):
-                k = int(len(line) * frac)
-                if k < 1 or k >= len(line) - 1:
-                    continue
-                self.draw_arrow(canvas, line[k], E[k], line_color)
+            self.draw_dashed_polyline(canvas, line, line_color, thickness=1,
+                                      dash=(7, 5))
+        ion_color = (255, 0, 255)  # magenta in BGR
+        for path in ion_paths:
+            cv2.polylines(canvas, [path.astype(np.int32)], False, ion_color,
+                          2, lineType=cv2.LINE_AA)
+            cv2.circle(canvas, tuple(path[0].astype(int)), 3, ion_color, -1,
+                       lineType=cv2.LINE_AA)
 
-        legend = (f"red +1.0 / blue -{self.charge_ratio:g}   "
-                  f"arrows: +ion drift")
-        cv2.rectangle(canvas, (0, 0), (w, 32), (0, 0, 0), -1)
-        cv2.putText(canvas, legend, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+        legend = (f"+ red / - blue (R={self.charge_ratio:g})   "
+                  f"cyan dashed: field lines   magenta: ion paths")
+        cv2.rectangle(canvas, (0, 0), (w, 28), (0, 0, 0), -1)
+        cv2.putText(canvas, legend, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                     (255, 255, 255), 1, cv2.LINE_AA)
 
         out = output or os.path.splitext(input_image)[0] + "_field.png"
@@ -249,4 +483,5 @@ class CoulombField:
 
     def show(self, path):
         """Open the rendered image in a preview window (headless-safe)."""
-        show_image(path, "coulomb field (cyan), + red / - blue")
+        show_image(path, "coulomb field: cyan dashed field lines, "
+                         "magenta ion paths (+ red / - blue)")
