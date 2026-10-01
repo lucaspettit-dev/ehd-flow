@@ -33,7 +33,7 @@ class FrameArtist:
         )
         for poly in self.polygons:
             pts = poly.closed_points()
-            ax.plot(pts[:, 0], pts[:, 1], "k-", lw=1.5)
+            ax.fill(pts[:, 0], pts[:, 1], color="white", ec="black", lw=1.5, zorder=3)
         ax.set_xlabel("x (m)")
         ax.set_ylabel("y (m)")
         ax.set_title(title)
