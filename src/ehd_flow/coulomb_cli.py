@@ -54,6 +54,9 @@ def build_parser():
                     help="stop iterating when grid |dE|/|E| < this")
     ap.add_argument("--sc-grid", type=int, default=32,
                     help="space-charge deposition grid cells across width")
+    ap.add_argument("--hide-ion-paths", action="store_true",
+                    help="keep ions in the physics (space charge) but "
+                         "do not draw their magenta paths")
     ap.add_argument("--no-window", action="store_true",
                     help="do not try to open a preview window")
     return ap
@@ -78,7 +81,8 @@ def main(argv=None):
                              sc_iters=args.sc_iters,
                              sc_relax=args.sc_relax,
                              sc_tol=args.sc_tol,
-                             sc_grid=args.sc_grid)
+                             sc_grid=args.sc_grid,
+                             draw_ion_paths=not args.hide_ion_paths)
     except (ImportError, ValueError) as e:
         sys.exit(f"error: {e}")
 

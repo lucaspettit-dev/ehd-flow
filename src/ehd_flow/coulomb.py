@@ -97,6 +97,9 @@ class CoulombField:
       sc_relax       -- under-relaxation factor for deposited charge.
       sc_tol         -- stop iterating when grid field change < this.
       sc_grid        -- space-charge deposition grid cells across width.
+      draw_ion_paths -- draw the magenta ion paths (False keeps the
+                        ions in the physics, e.g. for space charge,
+                        but hides their trajectories).
     """
 
     def __init__(self, charge_ratio=1.0, epsilon=0.002, min_area=10.0,
@@ -104,7 +107,7 @@ class CoulombField:
                  ions_per_positive=10, ion_qm=2.0, ion_dt=0.05,
                  ion_max_steps=4000, ion_v0=0.0,
                  space_charge=0.5, sc_iters=4, sc_relax=0.7,
-                 sc_tol=1e-3, sc_grid=32):
+                 sc_tol=1e-3, sc_grid=32, draw_ion_paths=True):
         if cv2 is None:
             raise ImportError(
                 "opencv-python is required (pip install opencv-python)")
@@ -124,6 +127,7 @@ class CoulombField:
         self.sc_relax = sc_relax
         self.sc_tol = sc_tol
         self.sc_grid = sc_grid
+        self.draw_ion_paths = draw_ion_paths
         self.extractor = PolygonExtractor(epsilon, min_area)
 
     # -- pipeline stages -------------------------------------------------
@@ -522,14 +526,17 @@ class CoulombField:
             self.draw_dashed_polyline(canvas, line, line_color, thickness=1,
                                       dash=(7, 5))
         ion_color = (255, 0, 255)  # magenta in BGR
-        for path in ion_paths:
-            cv2.polylines(canvas, [path.astype(np.int32)], False, ion_color,
-                          2, lineType=cv2.LINE_AA)
-            cv2.circle(canvas, tuple(path[0].astype(int)), 3, ion_color, -1,
-                       lineType=cv2.LINE_AA)
+        if self.draw_ion_paths:
+            for path in ion_paths:
+                cv2.polylines(canvas, [path.astype(np.int32)], False,
+                              ion_color, 2, lineType=cv2.LINE_AA)
+                cv2.circle(canvas, tuple(path[0].astype(int)), 3,
+                           ion_color, -1, lineType=cv2.LINE_AA)
 
         legend = (f"+ red / - blue (R={self.charge_ratio:g})   "
-                  f"cyan dashed: field lines   magenta: ion paths")
+                  f"cyan dashed: field lines")
+        if self.draw_ion_paths and ion_paths:
+            legend += "   magenta: ion paths"
         cv2.rectangle(canvas, (0, 0), (w, 28), (0, 0, 0), -1)
         cv2.putText(canvas, legend, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                     (255, 255, 255), 1, cv2.LINE_AA)
