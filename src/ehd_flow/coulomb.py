@@ -230,7 +230,7 @@ class CoulombField:
         return lines
 
     def trace_ion_paths(self, seeds, cpos_all, q_all, cpos_stop, bounds,
-                        capture):
+                        capture, solid_mask=None):
         """Integrate m*dv/dt = q*E (velocity Verlet) for positive ions.
 
         Unlike field lines (massless drift along E/|E|), ions carry
@@ -246,10 +246,16 @@ class CoulombField:
         Because dt varies, every saved point carries the dt it
         represents, so charge deposition can weight by residence time.
 
-        An ion stops when captured by a negative electrode, when it
-        leaves the domain, or at ion_max_steps. Returns (paths,
-        weights): paths are (K, 2) polylines, weights the (K,) dt
-        each point on the path represents.
+        Electrodes are solid: when ``solid_mask`` (an image-sized 0/1
+        array with every electrode filled) is given, each step's
+        segment is checked against it and an ion that reaches any
+        electrode stops there, its path clipped at the surface. This
+        matters because the field inside a charged ring is weak, so
+        an unchecked fast ion would coast straight through a positive
+        electrode. An ion also stops when captured near a negative
+        electrode's charges, when it leaves the domain, or at
+        ion_max_steps. Returns (paths, weights): paths are (K, 2)
+        polylines, weights the (K,) dt each point represents.
         """
         h, w = bounds
         qm = self.ion_qm
@@ -285,6 +291,16 @@ class CoulombField:
             V[idx] += 0.5 * A[idx] * dt       # half kick
             P[idx] += V[idx] * dt             # drift
             for i in idx:
+                if solid_mask is not None:
+                    hit = self._segment_solid_hit(paths[i][-1], P[i],
+                                                  solid_mask)
+                    if hit is not None:
+                        point, frac = hit
+                        paths[i].append(point)
+                        weights[i].append(dt * frac)
+                        P[i] = point
+                        alive[i] = False
+                        continue
                 paths[i].append(P[i].copy())
                 weights[i].append(dt)
             alive &= ((P[:, 0] >= 0) & (P[:, 0] <= w) &
@@ -304,6 +320,41 @@ class CoulombField:
         keep = [i for i, p in enumerate(paths) if len(p) > 4]
         return ([np.asarray(paths[i]) for i in keep],
                 [np.asarray(weights[i]) for i in keep])
+
+    @staticmethod
+    def _segment_solid_hit(a, b, mask):
+        """First entry point of segment a->b into a solid pixel.
+
+        Samples the segment at sub-pixel spacing (so no single step
+        can hop over a thin electrode) and bisects the entry bracket
+        to refine the surface crossing. Returns (point, frac) with
+        frac the fraction of the segment travelled, or None.
+        """
+        mh, mw = mask.shape
+
+        def solid(x, y):
+            xi = int(round(x))
+            yi = int(round(y))
+            return 0 <= xi < mw and 0 <= yi < mh and mask[yi, xi] > 0
+
+        seg = b - a
+        length = float(np.linalg.norm(seg))
+        n = max(1, int(np.ceil(length / 0.75)))
+        prev = a
+        for k in range(1, n + 1):
+            p = a + seg * (k / n)
+            if solid(p[0], p[1]):
+                lo, hi = prev, p
+                for _ in range(24):
+                    mid = 0.5 * (lo + hi)
+                    if solid(mid[0], mid[1]):
+                        hi = mid
+                    else:
+                        lo = mid
+                frac = float(np.linalg.norm(hi - a) / max(length, 1e-300))
+                return hi, min(max(frac, 0.0), 1.0)
+            prev = p
+        return None
 
     def _deposit_grid(self, bounds):
         """Fixed space-charge deposition grid: (centers (K,2), nx, ny).
@@ -384,6 +435,11 @@ class CoulombField:
         max_steps = int(2.5 * np.hypot(w, h) / self.line_step)
         capture = self.charge_spacing * 1.5
 
+        # filled-electrode mask: ions stop at any electrode surface
+        solid = np.zeros((h, w), dtype=np.uint8)
+        for _, pts in list(pos_polys) + list(neg_polys):
+            cv2.fillPoly(solid, [np.asarray(pts, dtype=np.int32)], 1)
+
         # ---- self-consistent space-charge iteration ----
         # Start from the bare electrode field; each round re-traces the
         # ion paths, deposits their charge on a fixed grid, relaxes it
@@ -415,7 +471,8 @@ class CoulombField:
                     ion_seeds = self.outward_seeds(
                         pos_polys, gap, count=self.ions_per_positive)
                     ion_paths, path_weights = self.trace_ion_paths(
-                        ion_seeds, cpos_all, q_all, neg[0], (h, w), capture)
+                        ion_seeds, cpos_all, q_all, neg[0], (h, w), capture,
+                        solid_mask=solid)
             if want_lines and len(neg[0]):
                 seeds = self.outward_seeds(neg_polys, gap)
                 back = self.trace_field_lines(
